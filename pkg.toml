@@ -1,0 +1,45 @@
+[layout]
+ports_dir = "ports"
+groups_dir = "groups"
+store_dir = "store"
+build_dir = "build"
+profile_dir = "profile"
+current_profile = "profile/current"
+lockfile = "ports.lock"
+
+[resolver]
+strategy = "strict"
+allow_unfree = false
+allow_insecure = false
+
+[resolver.overrides]
+# example = "1.2.3"
+
+[fetch]
+user_agent = "npkg/0.1"
+parallel = 8
+retry_max = 3
+retry_backoff_ms = 750
+allowed_protocols = ["https", "git+https"]
+
+[build]
+jobs = 8
+keep_build_dirs = false
+keep_failed_build_dirs = true
+backend_default = "make"
+env_passthrough = ["CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS"]
+
+[build.backends]
+make = { command = "make", install_target = "install" }
+gmake = { command = "gmake", install_target = "install" }
+cmake = { command = "cmake", configure_flags = ["-DCMAKE_BUILD_TYPE=Release"], build_tool = "ninja" }
+meson = { command = "meson", setup_flags = ["--buildtype=release"], build_tool = "ninja" }
+
+[profile]
+activate_symlink = "/usr/local"
+activate_target = "/usr/ports/profile/current"
+generations_to_keep = 5
+
+[integrity]
+require_source_hash = true
+hash_algo = "sha256"

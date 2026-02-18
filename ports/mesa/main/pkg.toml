@@ -1,0 +1,19 @@
+name = "mesa"
+version = "main"
+summary = "mesa package"
+license = "TBD"
+deps = []
+
+[src]
+type = "git"
+url = ""
+sha256 = ""
+
+[build]
+system = "meson"
+
+[scripts]
+patch = "patch.sh"
+build = "build.sh"
+install = "install.sh"
+check = "check.sh"

@@ -1,0 +1,19 @@
+name = "m4"
+version = "1.4.19"
+summary = "GNU M4"
+license = "GPL-3.0-or-later"
+deps = []
+
+[src]
+type = "url"
+url = "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"
+sha256 = ""
+
+[build]
+system = "make"
+
+[scripts]
+patch = "patch.sh"
+build = "build.sh"
+install = "install.sh"
+check = "check.sh"

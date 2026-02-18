@@ -1,0 +1,19 @@
+name = "recast_navigation"
+version = "main"
+summary = "recast_navigation package"
+license = "TBD"
+deps = []
+
+[src]
+type = "git"
+url = ""
+sha256 = ""
+
+[build]
+system = "cmake"
+
+[scripts]
+patch = "patch.sh"
+build = "build.sh"
+install = "install.sh"
+check = "check.sh"

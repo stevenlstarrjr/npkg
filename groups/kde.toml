@@ -1,0 +1,8 @@
+name = "kde"
+summary = "KDE desktop stack"
+
+ports = [
+  "wayland",
+  "wlroots",
+  "mesa",
+]
