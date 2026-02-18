@@ -1,19 +1,19 @@
 schema = 1
-state = "planned"
+state = "done"
 
 [[entry]]
 name = "m4"
 version = "1.4.19"
-status = "planned"
+status = "built"
 recipe = "ports/m4/1.4.19/pkg.toml"
-store = "store/<hash>-m4-1.4.19"
+store = "store/5a85eb52768c-m4-1.4.19"
 deps = []
 
 [[entry]]
 name = "example"
 version = "0.0.2"
-status = "planned"
+status = "built"
 recipe = "ports/example/0.0.2/pkg.toml"
-store = "store/<hash>-example-0.0.2"
+store = "store/f5b04f3c7653-example-0.0.2"
 deps = ["m4"]
 
