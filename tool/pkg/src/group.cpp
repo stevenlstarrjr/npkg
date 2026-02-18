@@ -1,6 +1,7 @@
 #include "pkg/group.hpp"
 
 #include <filesystem>
+#include <vector>
 
 #include "toml_util.hpp"
 
@@ -31,35 +32,69 @@ Result<Group> loadGroupFromPath(const std::filesystem::path& path) {
   return group;
 }
 
+std::vector<std::filesystem::path> candidateGroupDirs(
+    const std::filesystem::path& root,
+    const Config& config) {
+  std::vector<std::filesystem::path> dirs;
+  auto push_unique = [&](const std::filesystem::path& p) {
+    for (const auto& d : dirs) {
+      if (d == p) {
+        return;
+      }
+    }
+    dirs.push_back(p);
+  };
+  push_unique(root / config.layout.groups_dir);
+  push_unique(root / "groups");
+  push_unique(root / "group");
+  return dirs;
+}
+
 }  // namespace
 
 Result<Group> GroupStore::loadByName(const std::filesystem::path& root,
                                      const Config& config,
                                      std::string_view group_name) {
-  const auto path = root / config.layout.groups_dir / (std::string(group_name) + ".toml");
-  if (!std::filesystem::exists(path)) {
-    return Status{StatusCode::kNotFound,
-                  "Group file not found: " + path.string()};
+  std::string searched;
+  for (const auto& dir : candidateGroupDirs(root, config)) {
+    const auto path = dir / (std::string(group_name) + ".toml");
+    if (std::filesystem::exists(path)) {
+      return loadGroupFromPath(path);
+    }
+    if (!searched.empty()) {
+      searched += ", ";
+    }
+    searched += path.string();
   }
-  return loadGroupFromPath(path);
+  return Status{StatusCode::kNotFound,
+                "Group file not found. searched: " + searched};
 }
 
 Status GroupStore::validateAll(const std::filesystem::path& root,
                                const Config& config) {
-  const auto groups_dir = root / config.layout.groups_dir;
-  if (!std::filesystem::exists(groups_dir)) {
-    return Status{StatusCode::kNotFound,
-                  "Groups directory not found: " + groups_dir.string()};
-  }
-
-  for (const auto& entry : std::filesystem::directory_iterator(groups_dir)) {
-    if (!entry.is_regular_file() || entry.path().extension() != ".toml") {
+  bool found_any_dir = false;
+  for (const auto& groups_dir : candidateGroupDirs(root, config)) {
+    if (!std::filesystem::exists(groups_dir) ||
+        !std::filesystem::is_directory(groups_dir)) {
       continue;
     }
-    auto group = loadGroupFromPath(entry.path());
-    if (!group.ok()) {
-      return group.status();
+    found_any_dir = true;
+    for (const auto& entry : std::filesystem::directory_iterator(groups_dir)) {
+      if (!entry.is_regular_file() || entry.path().extension() != ".toml") {
+        continue;
+      }
+      auto group = loadGroupFromPath(entry.path());
+      if (!group.ok()) {
+        return group.status();
+      }
     }
+  }
+  if (!found_any_dir) {
+    return Status{StatusCode::kNotFound,
+                  "No group directory found (checked: " +
+                      (root / config.layout.groups_dir).string() + ", " +
+                      (root / "groups").string() + ", " +
+                      (root / "group").string() + ")"};
   }
   return Status::Ok();
 }
