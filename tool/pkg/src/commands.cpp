@@ -22,7 +22,9 @@ void printUsage() {
       << "Usage:\n"
       << "  pkg validate [--root <path>]\n"
       << "  pkg resolve --group <name> [--root <path>]\n"
+      << "  pkg resolve <port> [<port> ...] [--root <path>]\n"
       << "  pkg build --group <name> [--root <path>]\n"
+      << "  pkg build <port> [<port> ...] [--root <path>]\n"
       << "  pkg apply [--root <path>]\n";
 }
 
@@ -98,6 +100,21 @@ std::string parseGroup(const std::vector<std::string>& args) {
   return {};
 }
 
+std::vector<std::string> parsePortTargets(const std::vector<std::string>& args) {
+  std::vector<std::string> ports;
+  for (size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "--group" || args[i] == "--root") {
+      ++i;
+      continue;
+    }
+    if (!args[i].empty() && args[i][0] == '-') {
+      continue;
+    }
+    ports.push_back(args[i]);
+  }
+  return ports;
+}
+
 int runValidate(const std::filesystem::path& root) {
   auto cfg = ConfigStore::load(root);
   if (!cfg.ok()) {
@@ -131,18 +148,26 @@ Result<ResolveResult> resolveFromArgs(const std::filesystem::path& root,
   if (!cfg.ok()) {
     return cfg.status();
   }
+  Group resolved_group;
   std::string group_name = parseGroup(args);
-  if (group_name.empty()) {
-    return Status{StatusCode::kInvalidArgument,
-                  "--group <name> is required"};
+  if (!group_name.empty()) {
+    auto group = GroupStore::loadByName(root, cfg.value(), group_name);
+    if (!group.ok()) {
+      return group.status();
+    }
+    resolved_group = group.value();
+  } else {
+    auto ports = parsePortTargets(args);
+    if (ports.empty()) {
+      return Status{StatusCode::kInvalidArgument,
+                    "Provide --group <name> or one or more port names"};
+    }
+    resolved_group.name = "adhoc";
+    resolved_group.summary = "ad-hoc targets";
+    resolved_group.ports = std::move(ports);
   }
 
-  auto group = GroupStore::loadByName(root, cfg.value(), group_name);
-  if (!group.ok()) {
-    return group.status();
-  }
-
-  auto resolved = Resolver::resolveGroup(root, cfg.value(), group.value());
+  auto resolved = Resolver::resolveGroup(root, cfg.value(), resolved_group);
   if (!resolved.ok()) {
     return resolved.status();
   }
@@ -151,7 +176,7 @@ Result<ResolveResult> resolveFromArgs(const std::filesystem::path& root,
     *out_cfg = cfg.value();
   }
   if (out_group) {
-    *out_group = group.value();
+    *out_group = resolved_group;
   }
 
   return resolved;
