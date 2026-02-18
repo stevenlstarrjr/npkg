@@ -1,13 +1,17 @@
 #include "pkg/commands.hpp"
 
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "pkg/config.hpp"
 #include "pkg/group.hpp"
 #include "pkg/lockfile.hpp"
+#include "pkg/port.hpp"
 #include "pkg/resolver.hpp"
 
 namespace pkg {
@@ -24,6 +28,56 @@ void printUsage() {
 
 void printStatusError(const Status& status) {
   std::cerr << "error: " << status.message() << "\n";
+}
+
+std::string shellQuote(const std::string& value) {
+  std::string out = "'";
+  for (char c : value) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
+std::string hashKey(std::string_view text) {
+  const std::size_t h = std::hash<std::string_view>{}(text);
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0') << std::setw(16)
+      << static_cast<unsigned long long>(h);
+  return oss.str();
+}
+
+Status runScript(const std::filesystem::path& script_path,
+                 const std::filesystem::path& log_path,
+                 const PortRecipe& recipe,
+                 const std::filesystem::path& root,
+                 const std::filesystem::path& src_dir,
+                 const std::filesystem::path& build_dir,
+                 const std::filesystem::path& store_dir,
+                 int jobs) {
+  std::ostringstream cmd;
+  cmd << "env "
+      << "PKG_NAME=" << shellQuote(recipe.name) << " "
+      << "PKG_VERSION=" << shellQuote(recipe.version) << " "
+      << "PKG_ROOT=" << shellQuote(root.string()) << " "
+      << "PKG_SRC_DIR=" << shellQuote(src_dir.string()) << " "
+      << "PKG_BUILD_DIR=" << shellQuote(build_dir.string()) << " "
+      << "PKG_STORE_DIR=" << shellQuote(store_dir.string()) << " "
+      << "PKG_JOBS=" << shellQuote(std::to_string(jobs)) << " "
+      << "/bin/sh " << shellQuote(script_path.string())
+      << " >> " << shellQuote(log_path.string()) << " 2>&1";
+
+  const int rc = std::system(cmd.str().c_str());
+  if (rc != 0) {
+    return Status{StatusCode::kInternalError,
+                  "Script failed: " + script_path.string() + " (see " +
+                      log_path.string() + ")"};
+  }
+  return Status::Ok();
 }
 
 std::filesystem::path parseRoot(const std::vector<std::string>& args) {
@@ -140,20 +194,129 @@ int runBuild(const std::filesystem::path& root,
     entry.version = recipe.version;
     entry.status = "planned";
     entry.recipe = std::filesystem::relative(recipe.recipe_path, root).string();
-    entry.store = cfg.layout.store_dir + "/<hash>-" + recipe.name + "-" + recipe.version;
+    entry.store = cfg.layout.store_dir + "/" +
+                  hashKey(recipe.name + "@" + recipe.version).substr(0, 12) +
+                  "-" + recipe.name + "-" + recipe.version;
     entry.deps = recipe.deps;
     lock.entries.push_back(std::move(entry));
   }
 
+  const auto logs_dir = root / cfg.layout.build_dir / "logs";
+  std::error_code ec;
+  std::filesystem::create_directories(logs_dir, ec);
+  if (ec) {
+    printStatusError(Status{StatusCode::kIoError,
+                            "Failed to create logs dir: " + logs_dir.string()});
+    return 1;
+  }
+
+  bool has_failure = false;
+  const int jobs = std::max(1u, std::thread::hardware_concurrency());
+  for (size_t i = 0; i < lock.entries.size(); ++i) {
+    auto& entry = lock.entries[i];
+    const auto& recipe = resolved.value().nodes.at(entry.name).recipe;
+    const auto recipe_dir = recipe.recipe_path.parent_path();
+    const auto src_dir =
+        root / cfg.layout.build_dir / "src" / (recipe.name + "-" + recipe.version);
+    const auto build_dir =
+        root / cfg.layout.build_dir / (recipe.name + "-" + recipe.version);
+    const auto store_dir = root / entry.store;
+    const auto log_path =
+        logs_dir / (recipe.name + "-" + recipe.version + ".log");
+
+    if (has_failure) {
+      entry.status = "skipped";
+      continue;
+    }
+
+    if (std::filesystem::exists(store_dir) &&
+        !std::filesystem::is_empty(store_dir, ec)) {
+      entry.status = "reused";
+      continue;
+    }
+
+    std::filesystem::create_directories(src_dir, ec);
+    if (ec) {
+      entry.status = "failed";
+      has_failure = true;
+      continue;
+    }
+    std::filesystem::remove_all(build_dir, ec);
+    ec.clear();
+    std::filesystem::create_directories(build_dir, ec);
+    if (ec) {
+      entry.status = "failed";
+      has_failure = true;
+      continue;
+    }
+    std::filesystem::remove_all(store_dir, ec);
+    ec.clear();
+    std::filesystem::create_directories(store_dir, ec);
+    if (ec) {
+      entry.status = "failed";
+      has_failure = true;
+      continue;
+    }
+
+    const auto patch_script = recipe.scripts.patch.empty()
+                                  ? std::filesystem::path{}
+                                  : recipe_dir / recipe.scripts.patch;
+    const auto build_script = recipe_dir / recipe.scripts.build;
+    const auto install_script = recipe_dir / recipe.scripts.install;
+    const auto check_script = recipe.scripts.check.empty()
+                                  ? std::filesystem::path{}
+                                  : recipe_dir / recipe.scripts.check;
+
+    if (!patch_script.empty()) {
+      auto s = runScript(patch_script, log_path, recipe, root, src_dir, build_dir,
+                         store_dir, jobs);
+      if (!s.ok()) {
+        entry.status = "failed";
+        has_failure = true;
+        continue;
+      }
+    }
+    {
+      auto s = runScript(build_script, log_path, recipe, root, src_dir, build_dir,
+                         store_dir, jobs);
+      if (!s.ok()) {
+        entry.status = "failed";
+        has_failure = true;
+        continue;
+      }
+    }
+    {
+      auto s = runScript(install_script, log_path, recipe, root, src_dir,
+                         build_dir, store_dir, jobs);
+      if (!s.ok()) {
+        entry.status = "failed";
+        has_failure = true;
+        continue;
+      }
+    }
+    if (!check_script.empty()) {
+      auto s = runScript(check_script, log_path, recipe, root, src_dir, build_dir,
+                         store_dir, jobs);
+      if (!s.ok()) {
+        entry.status = "failed";
+        has_failure = true;
+        continue;
+      }
+    }
+
+    entry.status = "built";
+  }
+
+  lock.state = has_failure ? "failed" : "done";
   auto save = LockfileStore::save(root, cfg, lock);
   if (!save.ok()) {
     printStatusError(save);
     return 1;
   }
 
-  std::cout << "build: planned " << lock.entries.size() << " ports into "
+  std::cout << "build: processed " << lock.entries.size() << " ports into "
             << (root / cfg.layout.lockfile).string() << "\n";
-  return 0;
+  return has_failure ? 1 : 0;
 }
 
 int runApply(const std::filesystem::path& root) {
