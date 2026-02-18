@@ -1,5 +1,7 @@
 #include "pkg/commands.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -53,6 +55,115 @@ std::string hashKey(std::string_view text) {
   return oss.str();
 }
 
+Status runCommandToLog(const std::string& command,
+                       const std::filesystem::path& log_path) {
+  const std::string shell_cmd =
+      command + " >> " + shellQuote(log_path.string()) + " 2>&1";
+  const int rc = std::system(shell_cmd.c_str());
+  if (rc != 0) {
+    return Status{StatusCode::kInternalError,
+                  "Command failed: " + command + " (see " +
+                      log_path.string() + ")"};
+  }
+  return Status::Ok();
+}
+
+Status prepareSource(const PortRecipe& recipe,
+                     const std::filesystem::path& src_dir,
+                     const std::filesystem::path& downloads_dir,
+                     const std::filesystem::path& log_path) {
+  std::error_code ec;
+  std::filesystem::create_directories(src_dir, ec);
+  if (ec) {
+    return Status{StatusCode::kIoError,
+                  "Failed to create source dir: " + src_dir.string()};
+  }
+
+  if (recipe.src.type == "git") {
+    if (recipe.src.url.empty()) {
+      return Status::Ok();
+    }
+    const auto git_dir = src_dir / ".git";
+    if (!std::filesystem::exists(git_dir)) {
+      return runCommandToLog(
+          "git clone --depth 1 " + shellQuote(recipe.src.url) + " " +
+              shellQuote(src_dir.string()),
+          log_path);
+    }
+    auto s = runCommandToLog("git -C " + shellQuote(src_dir.string()) +
+                                 " fetch --depth 1 origin",
+                             log_path);
+    if (!s.ok()) {
+      return s;
+    }
+    return runCommandToLog("git -C " + shellQuote(src_dir.string()) +
+                               " reset --hard origin/HEAD",
+                           log_path);
+  }
+
+  if (recipe.src.type == "url") {
+    if (recipe.src.url.empty()) {
+      return Status::Ok();
+    }
+    std::filesystem::create_directories(downloads_dir, ec);
+    if (ec) {
+      return Status{StatusCode::kIoError,
+                    "Failed to create downloads dir: " + downloads_dir.string()};
+    }
+    std::string filename = "source.tar";
+    const auto slash = recipe.src.url.find_last_of('/');
+    if (slash != std::string::npos && slash + 1 < recipe.src.url.size()) {
+      filename = recipe.src.url.substr(slash + 1);
+    }
+    const auto archive_path =
+        downloads_dir / (recipe.name + "-" + recipe.version + "-" + filename);
+
+    std::string fetch_cmd;
+    fetch_cmd = "(command -v fetch >/dev/null 2>&1 && fetch -o " +
+                shellQuote(archive_path.string()) + " " +
+                shellQuote(recipe.src.url) +
+                ") || (command -v curl >/dev/null 2>&1 && curl -LfsS -o " +
+                shellQuote(archive_path.string()) + " " +
+                shellQuote(recipe.src.url) + ")";
+    auto s = runCommandToLog(fetch_cmd, log_path);
+    if (!s.ok()) {
+      return s;
+    }
+
+    if (!recipe.src.sha256.empty()) {
+      s = runCommandToLog(
+          "test \"$(sha256 -q " + shellQuote(archive_path.string()) +
+              ")\" = " + shellQuote(recipe.src.sha256),
+          log_path);
+      if (!s.ok()) {
+        return Status{StatusCode::kInternalError,
+                      "sha256 mismatch for " + archive_path.string()};
+      }
+    }
+
+    std::filesystem::remove_all(src_dir, ec);
+    ec.clear();
+    std::filesystem::create_directories(src_dir, ec);
+    if (ec) {
+      return Status{StatusCode::kIoError,
+                    "Failed to prepare source dir: " + src_dir.string()};
+    }
+
+    return runCommandToLog(
+        "tar -xf " + shellQuote(archive_path.string()) + " -C " +
+            shellQuote(src_dir.string()) + " --strip-components=1",
+        log_path);
+  }
+
+  if (recipe.src.type.empty()) {
+    return Status::Ok();
+  }
+
+  return Status{StatusCode::kInvalidArgument,
+                "Unsupported src.type for " + recipe.name + ": " +
+                    recipe.src.type};
+}
+
 Status runScript(const std::filesystem::path& script_path,
                  const std::filesystem::path& log_path,
                  const PortRecipe& recipe,
@@ -73,13 +184,7 @@ Status runScript(const std::filesystem::path& script_path,
       << "/bin/sh " << shellQuote(script_path.string())
       << " >> " << shellQuote(log_path.string()) << " 2>&1";
 
-  const int rc = std::system(cmd.str().c_str());
-  if (rc != 0) {
-    return Status{StatusCode::kInternalError,
-                  "Script failed: " + script_path.string() + " (see " +
-                      log_path.string() + ")"};
-  }
-  return Status::Ok();
+  return runCommandToLog(cmd.str(), log_path);
 }
 
 std::filesystem::path parseRoot(const std::vector<std::string>& args) {
@@ -237,6 +342,11 @@ int runBuild(const std::filesystem::path& root,
 
   bool has_failure = false;
   const int jobs = std::max(1u, std::thread::hardware_concurrency());
+  int built_count = 0;
+  int reused_count = 0;
+  int failed_count = 0;
+  int skipped_count = 0;
+  int planned_count = 0;
   for (size_t i = 0; i < lock.entries.size(); ++i) {
     auto& entry = lock.entries[i];
     const auto& recipe = resolved.value().nodes.at(entry.name).recipe;
@@ -245,18 +355,21 @@ int runBuild(const std::filesystem::path& root,
         root / cfg.layout.build_dir / "src" / (recipe.name + "-" + recipe.version);
     const auto build_dir =
         root / cfg.layout.build_dir / (recipe.name + "-" + recipe.version);
+    const auto downloads_dir = root / cfg.layout.build_dir / "downloads";
     const auto store_dir = root / entry.store;
     const auto log_path =
         logs_dir / (recipe.name + "-" + recipe.version + ".log");
 
     if (has_failure) {
       entry.status = "skipped";
+      ++skipped_count;
       continue;
     }
 
     if (std::filesystem::exists(store_dir) &&
         !std::filesystem::is_empty(store_dir, ec)) {
       entry.status = "reused";
+      ++reused_count;
       continue;
     }
 
@@ -264,6 +377,7 @@ int runBuild(const std::filesystem::path& root,
     if (ec) {
       entry.status = "failed";
       has_failure = true;
+      ++failed_count;
       continue;
     }
     std::filesystem::remove_all(build_dir, ec);
@@ -272,6 +386,7 @@ int runBuild(const std::filesystem::path& root,
     if (ec) {
       entry.status = "failed";
       has_failure = true;
+      ++failed_count;
       continue;
     }
     std::filesystem::remove_all(store_dir, ec);
@@ -280,6 +395,7 @@ int runBuild(const std::filesystem::path& root,
     if (ec) {
       entry.status = "failed";
       has_failure = true;
+      ++failed_count;
       continue;
     }
 
@@ -292,12 +408,23 @@ int runBuild(const std::filesystem::path& root,
                                   ? std::filesystem::path{}
                                   : recipe_dir / recipe.scripts.check;
 
+    {
+      auto s = prepareSource(recipe, src_dir, downloads_dir, log_path);
+      if (!s.ok()) {
+        entry.status = "failed";
+        has_failure = true;
+        ++failed_count;
+        continue;
+      }
+    }
+
     if (!patch_script.empty()) {
       auto s = runScript(patch_script, log_path, recipe, root, src_dir, build_dir,
                          store_dir, jobs);
       if (!s.ok()) {
         entry.status = "failed";
         has_failure = true;
+        ++failed_count;
         continue;
       }
     }
@@ -307,6 +434,7 @@ int runBuild(const std::filesystem::path& root,
       if (!s.ok()) {
         entry.status = "failed";
         has_failure = true;
+        ++failed_count;
         continue;
       }
     }
@@ -316,6 +444,7 @@ int runBuild(const std::filesystem::path& root,
       if (!s.ok()) {
         entry.status = "failed";
         has_failure = true;
+        ++failed_count;
         continue;
       }
     }
@@ -325,11 +454,19 @@ int runBuild(const std::filesystem::path& root,
       if (!s.ok()) {
         entry.status = "failed";
         has_failure = true;
+        ++failed_count;
         continue;
       }
     }
 
     entry.status = "built";
+    ++built_count;
+  }
+
+  for (const auto& entry : lock.entries) {
+    if (entry.status == "planned") {
+      ++planned_count;
+    }
   }
 
   lock.state = has_failure ? "failed" : "done";
@@ -341,6 +478,11 @@ int runBuild(const std::filesystem::path& root,
 
   std::cout << "build: processed " << lock.entries.size() << " ports into "
             << (root / cfg.layout.lockfile).string() << "\n";
+  std::cout << "build: built=" << built_count
+            << " reused=" << reused_count
+            << " failed=" << failed_count
+            << " skipped=" << skipped_count
+            << " planned=" << planned_count << "\n";
   return has_failure ? 1 : 0;
 }
 
